@@ -1,60 +1,53 @@
-import CSF
-import numpy as np
 import open3d as o3d
+import numpy as np
 
-class ClothSimulationFilter:
-    def __init__(self, config_file_path):
-        self.config_file_path = config_file_path
-        self.csf = CSF.CSF()
-        self.initialize_config()
+def load_point_cloud(file_path):
+    pcd = o3d.io.read_point_cloud(file_path)
+    return pcd
 
-    def initialize_config(self):
-        with open(self.config_file_path, 'r') as f:
-            config = {}
-            for line in f:
-                key, value = line.strip().split('=')
-                config[key] = value
+def register_point_clouds(source, target):
+    # 这里可以使用 ICP 或其他配准方法
+    threshold = 0.02
+    reg_icp = o3d.pipelines.registration.registration_icp(
+        source, target, threshold,
+        np.eye(4),
+        o3d.pipelines.registration.TransformationEstimationPointToPoint())
+    return reg_icp.transformation
 
-        # 从配置文件读取参数并设置 CSF 实例的参数
-        self.csf.params.bSloopSmooth = config.get("slop_smooth", "false").lower() == "true"
-        self.csf.params.class_threshold = float(config.get("class_threshold", 0.5))
-        self.csf.params.cloth_resolution = float(config.get("cloth_resolution", 0.1))
-        self.csf.params.interations = int(config.get("iterations", 500))
-        self.csf.params.rigidness = int(config.get("rigidness", 3))
-        self.csf.params.time_step = float(config.get("time_step", 0.65))
+def point_cloud_subtraction(source, target):
+    source.transform(target)
+    points_source = np.asarray(source.points)
+    points_target = np.asarray(target.points)
+    
+    # 点云相减
+    diff = points_source - points_target
+    # 计算差值的范数以确定哪些点是前景点
+    norm_diff = np.linalg.norm(diff, axis=1)
+    
+    # 设定一个阈值来过滤背景点
+    threshold = 0.1
+    foreground_indices = np.where(norm_diff > threshold)[0]
+    foreground_points = points_source[foreground_indices]
+    
+    # 创建新的点云对象
+    foreground_pcd = o3d.geometry.PointCloud()
+    foreground_pcd.points = o3d.utility.Vector3dVector(foreground_points)
+    
+    return foreground_pcd
 
-    def filter_ground_from_point_cloud(self, input_cloud):
-        # 将输入的 Open3D 点云转换为 numpy 数组
-        points = np.asarray(input_cloud.points)
+def main():
+    # 读取点云
+    source_pcd = load_point_cloud("source.ply")
+    target_pcd = load_point_cloud("target.ply")
+    
+    # 配准点云
+    transformation = register_point_clouds(source_pcd, target_pcd)
+    
+    # 点云相减
+    foreground_pcd = point_cloud_subtraction(source_pcd, target_pcd)
+    
+    # 可视化
+    o3d.visualization.draw_geometries([foreground_pcd])
 
-        # 设置输入点云到 CSF 库
-        self.csf.setPointCloud(points)
-
-        # 执行地面提取操作
-        ground_indexes = []
-        off_ground_indexes = []
-        self.csf.do_filtering(ground_indexes, off_ground_indexes, exportCloth=False)
-
-        # 使用 Open3D 根据索引创建地面点云
-        ground_cloud = o3d.geometry.PointCloud()
-        ground_cloud.points = o3d.utility.Vector3dVector(points[ground_indexes])
-
-        return ground_cloud
-
-
-# 示例用法
 if __name__ == "__main__":
-    # 假设您有一个配置文件 'config.txt' 和一个点云文件 'point_cloud.ply'
-    config_file_path = 'params.cfg'
-    point_cloud_file = 'point_cloud.pcd'
-
-    # 加载点云
-    input_cloud = o3d.io.read_point_cloud(point_cloud_file)
-
-    # 创建 ClothSimulationFilter 实例并滤除地面点
-    csf_filter = ClothSimulationFilter(config_file_path)
-    ground_cloud = csf_filter.filter_ground_from_point_cloud(input_cloud)
-
-    # 保存地面点云或可视化
-    o3d.io.write_point_cloud('ground_cloud.ply', ground_cloud)
-    o3d.visualization.draw_geometries([ground_cloud])
+    main()
