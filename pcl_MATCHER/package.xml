@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>pcl_matcher</name>
+  <version>0.0.1</version>
+  <description>Point cloud matching using Open3D and ROS in Python</description>
+
+  <maintainer email="your_email@example.com">Your Name</maintainer>
+  <license>BSD</license>
+
+  <!-- 构建依赖 -->
+  <buildtool_depend>catkin</buildtool_depend>
+
+  <!-- 运行时依赖 -->
+  <exec_depend>rospy</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+
+  <!-- Open3D 和其他依赖可以用 pip 安装，不需要在 package.xml 中声明 -->
+  <export>
+    <build_type>catkin</build_type>
+  </export>
+</package>
