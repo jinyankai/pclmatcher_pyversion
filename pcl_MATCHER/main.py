@@ -1,29 +1,32 @@
-# utf-8
+#!/usr/bin/env python3
+
 import rospy
 import open3d as o3d
 import time
 import numpy as np
-from geometry_msgs.msg import PoseWithCovarianceStamped, PointStamped
 from visualization_msgs.msg import Marker
 from sensor_msgs.msg import PointCloud2, PointField
 import std_msgs.msg
-from sensor_msgs.msg import Point_Cloud2 as pc2
+from sensor_msgs.point_cloud2 import create_cloud
 from sensor_msgs.point_cloud2 import read_points
 from geometry_msgs.msg import Point
 import threading
-from fasteuclideancluster import FastEuclideanCluster
+import subtraction
+
+
+# import multiprocessing
 
 
 class PCLMatcher:
     def __init__(self):
-        # 初始化 ROS 节点
+        # Initialize ROS node
         rospy.init_node("pcl_matcher", anonymous=True)
-        #fasteuclideancluster.py
+
+        # Initialize attributes
         self.fec = None
+        self.initial_alignment_transform = np.eye(4)
         self.centroids = []
         self.isLevel = True
-
-        # 初始化属性
         self.field_cloud = o3d.geometry.PointCloud()
         self.filtered_cloud = o3d.geometry.PointCloud()
         self.readyICP_cloud = o3d.geometry.PointCloud()
@@ -31,59 +34,55 @@ class PCLMatcher:
         self.ground_field = o3d.geometry.PointCloud()
         self.icp_cloud = o3d.geometry.PointCloud()
         self.cumulative_transform = np.eye(4)
-
-        # 定义 Y 轴的旋转和平移变换矩阵
-        theta = -np.pi / 12  # 假设传感器倾斜角度
-        level_rotation = o3d.geometry.get_rotation_matrix_from_axis_angle([0, theta, 0])
-        self.level_transform = np.eye(4)
-        self.level_transform[:3, :3] = level_rotation
-        self.level_transform[:3, 3] = [0.0, 0.0, -4.1]  # Z 轴平移
-
-        # ROS 订阅与发布
-        self.cloud_sub = rospy.Subscriber("/livox/lidar", PointCloud2, self.cloud_callback, queue_size=10)
-        self.field_pub = rospy.Publisher("field_cloud", PointCloud2, queue_size=1)
-        self.adjusted_pub = rospy.Publisher("adjusted_cloud", PointCloud2, queue_size=10)
-        self.icp_adjusted_pub = rospy.Publisher("icpadjusted_cloud", PointCloud2, queue_size=10)
-        self.obstacle_cloud_pub = rospy.Publisher("obstacle_cloud", PointCloud2, queue_size=10)
-        self.marker_pub = rospy.Publisher("visualization_marker", Marker, queue_size=10)
-        # self.initial_pose_sub = rospy.Subscriber("/initialpose", PoseWithCovarianceStamped, self.initial_pose_callback,
-        #                                         queue_size=1)
-        # self.clickpoint_sub = rospy.Subscriber("/clicked_point", PointStamped, self.clicked_point_callback,
-        #                                      queue_size=1)
-
-        # 启动线程
-        self.field_pub_thread = threading.Thread(target=self.field_cloud_publisher)
-        self.field_pub_thread.start()
-
-        self.icp_thread = threading.Thread(target=self.icp_run)
-        self.icp_thread.start()
-
-        self.cumulative_transform = np.eye(4)
+        self.ros_field_cloud = None
         self.isreadyICP = False
         self.isICPFinish = False
         self.isINITFinish = False
         self.initial_pose = np.eye(4)
-
         self.max_icp_iterations = 10
         self.fitness_score_threshold = 0.01
-
         self.cloud_buffer = []
+
         self.map_feature_points = []
         self.sensor_feature_points = []
+        # self.lock = threading.Lock()
 
-        self.lock = threading.Lock()
+
+        # Define Y-axis rotation and translation transformation matrix
+        theta = -np.pi / 12  # Assume sensor tilt angle
+        level_rotation = o3d.geometry.get_rotation_matrix_from_axis_angle([0, theta, 0])
+        self.level_transform = np.eye(4)
+        self.level_transform[:3, :3] = level_rotation
+        self.level_transform[:3, 3] = [0.0, 0.0, -4.1]  # Z-axis translation
+
+        # ROS subscribers and publishers
+        self.cloud_sub = rospy.Subscriber("/livox/lidar", PointCloud2, self.cloud_callback, queue_size=10)
+        self.field_pub = rospy.Publisher("field_cloud", PointCloud2, queue_size=1)
+        self.adjusted_pub = rospy.Publisher("adjusted_cloud", PointCloud2, queue_size=10)
+        self.icp_adjusted_pub = rospy.Publisher("icp_adjusted_cloud", PointCloud2, queue_size=10)
+        self.obstacle_cloud_pub = rospy.Publisher("obstacle_cloud", PointCloud2, queue_size=10)
+        self.marker_pub = rospy.Publisher("visualization_marker", Marker, queue_size=10)
+
+        # Start threads
+        self.field_pub_thread = threading.Thread(target=self.field_cloud_publisher,daemon=True)
+        # self.field_pub_thread.start()
+
+        # #
+        self.icp_thread = threading.Thread(target=self.icp_run,daemon=True)
+        # print('1'*50)#
+        #self.icp_thread.start()
 
     def __del__(self):
         """
         Destructor to ensure threads are joined safely.
         """
-        rospy.loginfo("Shutting down PCLMatcher...")
-        self.running = False
-        if self.field_pub_thread.is_alive():
-            self.field_pub_thread.join()  # 等待线程完成
-        if self.icp_thread.is_alive():
-            self.icp_thread.join()  # 等待线程完成
-        rospy.loginfo("PCLMatcher shut down.")
+        # rospy.loginfo("Shutting down PCLMatcher...")
+        # self.running = False
+        # if self.field_pub_thread.is_alive():
+        #     self.field_pub_thread.join()  # 等待线程完成
+        # if self.icp_thread.is_alive():
+        #     self.icp_thread.join()  # 等待线程完成
+        # rospy.loginfo("PCLMatcher shut down.")
 
     def open3d_to_ros(self,o3d_cloud, frame_id="map"):
         """
@@ -106,7 +105,7 @@ class PCLMatcher:
         header = std_msgs.msg.Header()
         header.stamp = rospy.Time.now()
         header.frame_id = frame_id
-        ros_cloud = pc2.create_cloud(header, fields, points)
+        ros_cloud = create_cloud(header, fields, points)
         return ros_cloud
 
     def ros_to_open3d(self,ros_cloud):
@@ -137,25 +136,33 @@ class PCLMatcher:
 
             # 应用体素滤波
             self.field_cloud = self.field_cloud.voxel_down_sample(voxel_size=0.1)
+            #level_rotation = o3d.geometry.get_rotation_matrix_from_axis_angle([0, -np.pi / 12, 0])
+            self.field_cloud.transform(np.linalg.inv(self.level_transform))
 
             # 转换为 ROS PointCloud2 消息
-            self.ros_field_cloud = self.open3d_to_ros(self.field_cloud)
+            self.ros_field_cloud = self.open3d_to_ros(self.field_cloud,frame_id="livox_frame")
+            # self.field_pub.publish(self.ros_field_cloud)
             rospy.loginfo(f"Point cloud filtered and converted to ROS PointCloud2 format.")
         except Exception as e:
             rospy.logerr(f"Couldn't read file {file_path}: {e}")
 
+    def subtraction_pcd(self,src_pcd):
+        sub = subtraction.Subtraction()
+        pcd = sub.main_subtract(src_pcd)
+        return pcd
 
 
     def field_cloud_publisher(self):
         """
         Periodically publishes the point cloud to a ROS topic.
         """
-        rate = rospy.Rate(10)  # 设置发布频率为10Hz
+        rate = rospy.Rate(10)
         while not rospy.is_shutdown():
-            if self.ros_field_cloud is not None:
-                self.ros_field_cloud.header.frame_id = "livox_frame"
-                self.ros_field_cloud.header.stamp = rospy.Time.now()
-                self.field_pub.publish(self.ros_field_cloud)
+
+            # 转换为 ROS 点云消息并发布
+            ros_field_cloud = self.open3d_to_ros(self.field_cloud, frame_id="livox_frame")
+            self.field_pub.publish(ros_field_cloud)
+            rospy.loginfo("Published field point cloud.")
             rate.sleep()
 
     def icp_function(self, source_cloud, target_cloud, transformation_epsilon, max_correspondence_distance,
@@ -171,6 +178,7 @@ class PCLMatcher:
         :return: aligned_cloud (Open3D PointCloud), final_transform (4x4 transformation matrix)
         """
         start_time = time.time()
+        # source_cloud = self.subtraction_pcd(source_cloud)
 
         # Initialize ICP settings
         criteria = o3d.pipelines.registration.ICPConvergenceCriteria(
@@ -206,34 +214,36 @@ class PCLMatcher:
         运行 ICP 的主线程
         """
         rate = rospy.Rate(10)  # 设置发布频率 10Hz
-        while not rospy.is_shutdown():
-            if self.isreadyICP:
-                # 执行 ICP 对齐
-                final_transform = self.icp_function(
-                    self.readyICP_cloud,
-                    self.field_cloud,
-                    transformation_epsilon=1e-10,
-                    max_correspondence_distance=1,
-                    euclidean_fitness_epsilon=0.001,
-                    max_iterations=50
-                )
 
-                # 更新累积变换矩阵
-                self.initial_alignment_transform = np.dot(final_transform, self.initial_alignment_transform)
-                rospy.loginfo("ICP run: Initial alignment transform matrix:")
-                rospy.loginfo("\n" + str(self.initial_alignment_transform))
+        if self.isreadyICP:
+            # 执行 ICP 对齐
+            rospy.loginfo("Running ICP...")
+            self.readyICP_cloud, final_transform = self.icp_function(
+                self.readyICP_cloud,
+                self.field_cloud,
+                transformation_epsilon=1e-10,
+                max_correspondence_distance=1,
+                euclidean_fitness_epsilon=0.001,
+                max_iterations=50
+            )
+            # rospy.loginfo("ICP run: Final transform matrix:", final_transform)
+            # 更新累积变换矩阵
+            self.initial_alignment_transform = np.dot(final_transform, self.initial_alignment_transform)
+            rospy.loginfo("ICP run: Initial alignment transform matrix:")
+            rospy.loginfo("\n" + str(self.initial_alignment_transform))
 
-                self.isICPFinish = True
+            self.isICPFinish = True
 
-            if self.isICPFinish:
-                self.isreadyICP = False
+        if self.isICPFinish:
 
-                # 转换为 ROS 点云消息并发布
-                ros_adjusted_cloud = self.open3d_to_ros(self.readyICP_cloud, frame_id="livox_frame")
-                self.icp_adjusted_pub.publish(ros_adjusted_cloud)
-                rospy.loginfo("Published ICP adjusted point cloud.")
+            # 转换为 ROS 点云消息并发布
 
-            rate.sleep()
+            icp_adjusted_cloud = self.open3d_to_ros(self.readyICP_cloud, frame_id="livox_frame")
+            self.icp_adjusted_pub.publish(icp_adjusted_cloud)
+            rospy.loginfo("Published ICP adjusted point cloud.")
+
+
+        rate.sleep()
 
     def publish_centroid_markers(self, centroids):
         """
@@ -260,15 +270,17 @@ class PCLMatcher:
 
         # 添加质心点
         for centroid in centroids:
+
             p = Point()
             p.x = centroid[0]
             p.y = centroid[1]
             p.z = centroid[2]
             points.points.append(p)
-
         # 发布 Marker
+        # rate = rospy.Rate(10)  # 设置发布频率 10Hz
         self.marker_pub.publish(points)
         rospy.loginfo("Published centroid markers.")
+
 
     def upsample_voxel_grid(self,cloud, leaf_size, points_per_voxel):
         """
@@ -365,6 +377,83 @@ class PCLMatcher:
 
         return filtered_cloud
 
+    def compute_similarity(self,pcd1, pcd2, distance_threshold=35.0):
+        """
+        Compute the similar points between two point clouds.
+
+        Parameters:
+        - pcd1: Open3D PointCloud object 1
+        - pcd2: Open3D PointCloud object 2
+        - distance_threshold: Maximum distance for similar points, default 100
+
+        Returns:
+        - similar_points: List of similar points
+        """
+        pcd1_tree = o3d.geometry.KDTreeFlann(pcd1)
+        similar_points = []
+        pcd2_points = np.asarray(pcd2.points)
+
+        for point in np.asarray(pcd1.points):
+            [_, idx, _] = pcd1_tree.search_knn_vector_3d(point, 1)
+            if idx[0] < len(pcd2_points):
+                dist = np.linalg.norm(pcd2_points[idx[0]] - point)
+                if dist < distance_threshold:
+                    similar_points.append(point)
+
+        return np.array(similar_points)
+
+    def compute_difference(self,pcd1, pcd2, distance_threshold=0.01):
+        """
+        Compute the difference between two point clouds by removing similar points.
+
+        Parameters:
+        - pcd1: Open3D PointCloud object 1
+        - pcd2: Open3D PointCloud object 2
+        - distance_threshold: Maximum distance for similar points, default 100
+
+        Returns:
+        - diff_pcd: PointCloud object containing the difference points
+        """
+        similar_points = self.compute_similarity(pcd1, pcd2, distance_threshold = distance_threshold)
+
+        if similar_points.size == 0:
+            raise RuntimeError("No similar points found between the point clouds.")
+
+        pcd1_diff_points = [point for point in np.asarray(pcd1.points) if
+                            np.linalg.norm(similar_points - point, axis=1).min() >= distance_threshold]
+        pcd2_diff_points = [point for point in np.asarray(pcd2.points) if
+                            np.linalg.norm(similar_points - point, axis=1).min() >= distance_threshold]
+
+        if len(pcd1_diff_points) == 0 and len(pcd2_diff_points) == 0:
+            raise RuntimeError("No different points found between the point clouds.")
+
+        diff_pcd = o3d.geometry.PointCloud()
+        diff_pcd.points = o3d.utility.Vector3dVector(np.concatenate([pcd1_diff_points, pcd2_diff_points], axis=0))
+
+        return diff_pcd
+
+    def segment_differences(self,cloud1, cloud2, distance_threshold = 0.1):
+        # 将Open3D点云转换为NumPy数组
+        points1 = np.asarray(cloud1.points)
+        points2 = np.asarray(cloud2.points)
+
+        # 创建KD树
+        kdtree = o3d.geometry.KDTreeFlann(points2)
+
+        # 存储差异点云
+        diff_cloud1 = o3d.geometry.PointCloud()
+        # diff_cloud2 = o3d.geometry.PointCloud()
+
+        # 遍历cloud1中的每个点，使用KD树搜索cloud2中半径为distance_threshold的邻居点
+        for point in points1:
+            [_, idx, _] = kdtree.search_radius_vector_xd(point, distance_threshold)
+            if len(idx) == 0:  # 如果没有找到邻居点，则认为是属于cloud1的差异点
+                diff_cloud1.points.append(o3d.utility.Vector3dVector(point))
+
+        # 遍历cloud2中的每个点，使用KD树搜索cloud1中半径为distance_threshold的邻居点
+
+
+        return diff_cloud1
     def remove_overlapping_points(self,live_cloud, field_cloud):
         """
         去除动态点云的重叠点并进行障碍物分析和发布。
@@ -375,10 +464,13 @@ class PCLMatcher:
         # 差异计算
         live_points = np.asarray(live_cloud.points)
         field_points = np.asarray(field_cloud.points)
-        diff_points = [p for p in live_points if tuple(p) not in set(map(tuple, field_points))]
+        diff_cloud = self.segment_differences(live_cloud, field_cloud, distance_threshold=0.1)
 
-        dynamic_obstacles = o3d.geometry.PointCloud()
-        dynamic_obstacles.points = o3d.utility.Vector3dVector(diff_points)
+        dynamic_obstacles = o3d.geometry.PointCloud(diff_cloud)
+
+
+
+
 
         # Y 轴滤波
         y_filtered = []
@@ -401,16 +493,57 @@ class PCLMatcher:
                 z_filtered.append(point)
         dynamic_obstacles.points = o3d.utility.Vector3dVector(np.array(z_filtered))
 
-        # 发布动态障碍物点云
-        ros_dynamic_obstacles = self.open3d_to_ros(dynamic_obstacles, frame_id="livox_frame")
-        self.obstacle_cloud_pub.publish(ros_dynamic_obstacles)
+
 
         # 计算质心并发布
         dynamic_obstacles=self.radius_outlier_removal(dynamic_obstacles, 0.5, 2, 0.1, 10)
-        centroids = self.fast_euclidean_cluster(dynamic_obstacles,0.5, 50, 2, 50000)
+        _,centroids = self.fast_euclidean_cluster(dynamic_obstacles,0.5, 50, 2, 50000)
+        # _,centroids = self.euclidean_cluster(dynamic_obstacles, 0.5, 2, 50000)
         # 累加点云
-        self.upsample_voxel_grid(dynamic_obstacles, 0.1, 500)# 每个体素中生成10个点
+        dynamic_obstacles=self.upsample_voxel_grid(dynamic_obstacles, 0.1, 500)# 每个体素中生成10个点
+        # 发布动态障碍物点云
+        ros_dynamic_obstacles = self.open3d_to_ros(dynamic_obstacles, frame_id="livox_frame")
+        self.obstacle_cloud_pub.publish(ros_dynamic_obstacles)
+        # 打印信息到终端
+        rospy.loginfo(f"Published dynamic obstacle cloud with {len(dynamic_obstacles.points)} points.")
+        # rospy.loginfo(f"Published dynamic obstacle cloud with {len(dynamic_obstacles.points)} points.")
         self.publish_centroid_markers(centroids)
+
+
+    def euclidean_cluster(self,cloud, radius, min_cluster_size, max_cluster_size):
+        """
+        使用欧式聚类算法对点云进行聚类。
+        :param cloud: 输入点云 (o3d.geometry.PointCloud)
+        :param radius: 搜索半径
+        :param min_cluster_size: 最小聚类点数
+        :param max_cluster_size: 最大聚类点数
+        :return: 合并后的点云，质心列表
+        """
+        start_time = time.time()
+        # 实例化聚类对象
+        cluster = o3d.geometry.PointCloud()
+        cluster.points = o3d.utility.Vector3dVector(np.asarray(cloud.points))
+        # 保存聚类结果和质心
+        centroids = []
+        cluster_result = o3d.geometry.PointCloud()
+        labels = np.array(cluster.cluster_dbscan(eps=radius, min_points=min_cluster_size, print_progress=False))    # DBSCAN 聚类
+
+        for i in range(labels.max() + 1):
+            # 提取当前聚类的点云
+            cluster_points = np.asarray(cloud.points)[labels == i]
+            cluster_cloud = o3d.geometry.PointCloud()
+            cluster_cloud.points = o3d.utility.Vector3dVector(cluster_points)
+
+            # 合并聚类结果
+            cluster_result += cluster_cloud
+
+            # 计算质心
+            centroid = np.mean(cluster_points, axis=0)
+            centroids.append(centroid)
+
+        elapsed_time = (time.time() - start_time) * 1000
+        print(f"欧式聚类用时：{elapsed_time:.2f} ms")
+        return cluster_result, centroids
 
     def fast_euclidean_cluster(self,cloud, radius, search_max_size, min_cluster_size, max_cluster_size):
         """
@@ -470,8 +603,14 @@ class PCLMatcher:
         return cloud_filtered
 
     def cloud_callback(self, input_cloud):
+        # print('&' * 50)
+
+
         # 将 ROS 点云消息转换为 Open3D 点云
+        rospy.loginfo("Received point cloud.")
         source_cloud = self.ros_to_open3d(input_cloud)
+        rospy.loginfo("field_cloud_publisher.")
+        # self.field_cloud_publisher()
 
         # 初始化水平角度
         if not self.isLevel:
@@ -486,7 +625,7 @@ class PCLMatcher:
         source_cloud = self.pass_through_filter(source_cloud, "y", -8.0, 8.0)
         source_cloud = self.pass_through_filter(source_cloud, "z", -10, 3)
 
-        # 累加远处点
+        # 对原始点云中的每个点进行操作
         source_points = np.asarray(source_cloud.points)
         accumulated_points = []
         for point in source_points:
@@ -499,23 +638,38 @@ class PCLMatcher:
         # 根据处理阶段，决定发布或缓存点云
         if not self.isINITFinish:
             ros_adjusted_cloud = self.open3d_to_ros(source_cloud, frame_id="livox_frame")
+            rospy.loginfo("Published adjusted point cloud.")
             self.adjusted_pub.publish(ros_adjusted_cloud)
         else:
             # 应用初始变换
             source_cloud.transform(self.initial_alignment_transform)
             ros_adjusted_cloud = self.open3d_to_ros(source_cloud, frame_id="livox_frame")
+            rospy.loginfo("Published adjusted point cloud.")
             self.adjusted_pub.publish(ros_adjusted_cloud)
 
             # 缓存点云
-            if len(self.cloud_buffer) < 20:
-                self.cloud_buffer.append(source_cloud)
-                if len(self.cloud_buffer) == 19:
-                    self.readyICP_cloud = self.merge_point_clouds(self.cloud_buffer)
-                    self.isreadyICP = True
 
-        # 如果 ICP 已完成，移除重叠点
-        if self.isICPFinish:
-            self.remove_overlapping_points(source_cloud, self.field_cloud)
+        print("1" * 50)
+        if len(self.cloud_buffer) < 20:
+            rospy.loginfo("ICP buffering...")
+            self.cloud_buffer.append(source_cloud)
+            if len(self.cloud_buffer) == 19:
+                self.readyICP_cloud = self.merge_point_clouds(self.cloud_buffer)
+                rospy.loginfo("ICP ready.")
+                self.isreadyICP = True
+                self.cloud_buffer.clear()
+                self.icp_run()
+                # 如果 ICP 已完成，移除重叠点
+                if(self.isICPFinish):
+                    rospy.loginfo("Removing overlapping points...")
+                    self.remove_overlapping_points(self.readyICP_cloud, self.field_cloud)
+
+
+
+
+
+
+
 
     def pass_through_filter(self, cloud, axis, min_value, max_value):
         """
@@ -531,19 +685,104 @@ class PCLMatcher:
         """
         ROS 节点的主入口函数。
         """
-        rospy.init_node("pcl_matcher_node", anonymous=True)
-
+        # rospy.init_node("pcl_matcher_node", anonymous=True)
+        # print('8'*50)
         # 初始化 PCLMatcher 实例
         matcher = PCLMatcher()
+        rospy.loginfo("PCLMatcher node initialized.")
+        #$self.icp_thread.start()
 
         # 加载 PCD 文件
-        pcd_file_path = "/"
+        pcd_file_path = "/home/nvidia/RadarWorkspace/data/m_cloud_bg_new.pcd"
         matcher.load_pcd(pcd_file_path)
 
         # 开始 ROS spin 循环
+        # self.icp_thread.join()
+        # self.field_pub_thread.join()
+
+        # matcher.icp_run()
         rospy.spin()
 
 
+        # subprocess.call(['roslaunch','pcl_matcher','launch/pcl_matcher.launch'], shell=True)
+
+import random
+class FastEuclideanCluster:
+    def __init__(self, pcd):
+        self.m_tolerance = 0.02
+        self.max_size = 50
+        self.m_min_cluster_size = 100
+        self.m_max_cluster_size = 25000
+        self.m_pcd = pcd
+    def setInputCloud(self,pcd): # 输入点云
+            self.m_pcd = pcd
+    def setSearchMaxsize(self,max_size):
+            self.max_size = max_size
+    def setClusterTolerance(self,tolerance):# 搜索半径
+            self.m_tolerance = tolerance
+    def setMinClusterSize(self,min_cluster_size):# 聚类最小点数
+            self.m_min_cluster_size = min_cluster_size
+    def setMaxClusterSize(self,max_cluster_size):# 聚类最大点数
+            self.m_max_cluster_size = max_cluster_size
+    def euclidean_cluster(self,cluster_indices):# 欧式聚类
+
+            labels = np.zeros(len(self.m_pcd.points), dtype=int)  # 初始化标签为0
+            seg_lab = 1
+            cluster_indices = []
+
+            # 创建kd-tree
+            pcd_tree = o3d.geometry.KDTreeFlann(self.m_pcd)
+
+            for i in range(len(self.m_pcd.points)):
+                if labels[i] == 0:  # 标签为0
+                    [k, idx, _] = pcd_tree.search_radius_vector_3d(self.m_pcd.points[i], self.m_tolerance)
+                    n_labs = {labels[j] for j in idx if labels[j] != 0}  # 使用集合推导
+
+                        # 找到最小标签
+
+                    min_seg_lab = min(n_labs) if n_labs else seg_lab
+
+                    # 合并标签
+                    for n_lab in n_labs:
+                        if n_lab > min_seg_lab:
+                            labels[labels == n_lab] = min_seg_lab
+
+                    labels[idx] = min_seg_lab  # 标记邻近点
+                    seg_lab += 1
+
+            # 根据标签生成聚类索引
+            seg_id = {}
+            index = 1
+
+            for i, label in enumerate(labels):
+                if label not in seg_id:
+                    seg_id[label] = index
+                    cluster_indices.append([])
+                    index += 1
+                cluster_indices[seg_id[label] - 1].append(i)
+
+            # 筛选符合条件的聚类
+            valid_clusters = [cluster for cluster in cluster_indices if
+                              self.m_tolerance < len(cluster) < self.m_max_cluster_size]
+
+            return valid_clusters
+
+        # 使用示例
+        # pcd = o3d.io.read_point_cloud("your_point_cloud.ply")
+        # clusterer = FastEuclideanCluster(pcd, tolerance=0.05, min_cluster_size=10, max_cluster_size=100)
+        # clusters = clusterer.extract()
+    def clusterColor(self,pcd): # 聚类结果分类渲染
+            R = random.randint(0,255)
+            G = random.randint(0,255)
+            B = random.randint(0,255)
+            for i in range(len(pcd.points)):
+                pcd.colors[i] = [R,G,B]
+            return pcd
+
+
+
 if __name__ == "__main__":
-    matcher = PCLMatcher()
-    matcher.main()
+    # &
+    # print('8' * 50)
+    pcl_matcher = PCLMatcher()
+    pcl_matcher.main()
