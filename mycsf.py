@@ -1,66 +1,40 @@
-import open3d as o3d
+import cupy as cp
 import numpy as np
-import time
+from scipy.spatial import distance
 
-def load_point_cloud(file_path):
-    pcd = o3d.io.read_point_cloud(file_path)
-    return pcd
+# 生成点云数据，假设有20000个3D点
+num_points = 20000
+points_cpu = np.random.rand(num_points, 3).astype(np.float32)
 
-def compute_difference(Acloud, Bcloud, threshold):
-    # KDTree 搜索
-    kdtree = o3d.geometry.KDTreeFlann(Acloud)
-    
-    # 标记重合点
-    LA01 = np.zeros(len(Acloud.points), dtype=int)  # Acloud 中的重合标记
-    LB01 = np.zeros(len(Bcloud.points), dtype=int)  # Bcloud 中的重合标记
+# 将数据从CPU传到GPU
+points_gpu = cp.asarray(points_cpu)
 
-    for i in range(len(Bcloud.points)):
-        [k, idx, _] = kdtree.search_knn_vector_3d(Bcloud.points[i], 1)
-        if k > 0 and np.linalg.norm(Bcloud.points[i] - Acloud.points[idx[0]]) <= threshold:
-            LB01[i] = 1
-            LA01[idx[0]] = 1
+# 计算欧氏距离矩阵（可以用CuPy来加速计算）
+def compute_distance_matrix(points_gpu):
+    # 计算点之间的欧氏距离矩阵
+    # 点云数据是N x 3维度，使用广播机制来计算所有点对的距离
+    dist_matrix = cp.linalg.norm(points_gpu[:, cp.newaxis] - points_gpu, axis=2)
+    return dist_matrix
 
-    # 提取不同点
-    LA = [i for i in range(len(Acloud.points)) if LA01[i] == 0]
-    LB = [i for i in range(len(Bcloud.points)) if LB01[i] == 0]
+# 计算距离矩阵
+dist_matrix = compute_distance_matrix(points_gpu)
 
-    Arecloud = Acloud.select_by_index(LA)  # A 中剩余的点
-    Brecloud = Bcloud.select_by_index(LB)  # B 中剩余的点
+# 设置一个距离阈值，来判断哪些点是重叠的
+threshold = 0.02  # 设置重叠点的距离阈值
+overlap_mask = dist_matrix < threshold
 
-    return Arecloud, Brecloud
+# 设置对角线为False，因为每个点与自己距离为0
+cp.fill_diagonal(overlap_mask, False)
 
-def visualize_point_clouds(Acloud, Bcloud, Brecloud):
-    vis = o3d.visualization.Visualizer()
-    vis.create_window()
+# 通过mask去除重叠点
+# 重叠点将被标记为True，我们根据这个mask来去除重复点
+unique_points_mask = cp.any(overlap_mask, axis=1)
 
-    vis.add_geometry(Acloud)
-    vis.add_geometry(Bcloud)
-    vis.add_geometry(Brecloud)
+# 得到不重复的点云
+unique_points = points_gpu[~unique_points_mask]
 
-    vis.run()
-    vis.destroy_window()
+# 将结果从GPU转回到CPU
+unique_points_cpu = cp.asnumpy(unique_points)
 
-def main():
-    start_time = time.time()
-
-    # 读取点云
-    Acloud = load_point_cloud("1 - Cloud.pcd")
-    Bcloud = load_point_cloud("yv1 Cloud.pcd")
-
-    # 设置阈值
-    threshold = 1e-5  # 你可以根据需要调整这个值
-
-    # 计算差异
-    Arecloud, Brecloud = compute_difference(Acloud, Bcloud, threshold)
-
-    # 保存结果
-    o3d.io.write_point_cloud("FISHNEEDLVBO.pcd", Brecloud)
-
-    # 可视化
-    visualize_point_clouds(Acloud, Bcloud, Brecloud)
-
-    end_time = time.time()
-    print(f"处理时间: {end_time - start_time:.4f} 秒")
-
-if __name__ == "__main__":
-    main()
+# 打印去重后的点云
+print(f"去重后的点云数量: {unique_points_cpu.shape[0]}")
