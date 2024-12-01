@@ -1,40 +1,174 @@
-import cupy as cp
 import numpy as np
-from scipy.spatial import distance
+import open3d as o3d
+from scipy.spatial import KDTree
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 
-# 生成点云数据，假设有20000个3D点
-num_points = 20000
-points_cpu = np.random.rand(num_points, 3).astype(np.float32)
+class BucketSet:
+    def __init__(self, size):
+        self.bucket = np.zeros(size, dtype=bool)
+        self.size = 0
+        self.now_first = -1
 
-# 将数据从CPU传到GPU
-points_gpu = cp.asarray(points_cpu)
+    def insert(self, value):
+        if not self.bucket[value]:
+            self.bucket[value] = True
+            self.size += 1
+            if value < self.now_first or self.now_first == -1:
+                self.now_first = value
 
-# 计算欧氏距离矩阵（可以用CuPy来加速计算）
-def compute_distance_matrix(points_gpu):
-    # 计算点之间的欧氏距离矩阵
-    # 点云数据是N x 3维度，使用广播机制来计算所有点对的距离
-    dist_matrix = cp.linalg.norm(points_gpu[:, cp.newaxis] - points_gpu, axis=2)
-    return dist_matrix
+    def erase(self, value):
+        if self.bucket[value]:
+            self.bucket[value] = False
+            self.size -= 1
+            if self.size == 0:
+                self.now_first = -1
+            elif value == self.now_first:
+                for i in range(value + 1, len(self.bucket)):
+                    if self.bucket[i]:
+                        self.now_first = i
+                        break
 
-# 计算距离矩阵
-dist_matrix = compute_distance_matrix(points_gpu)
+def differing_dbscan(cloud, zero_pos, eps, min_points_k):
+    # Check if the point cloud is empty
+    if len(cloud.points) == 0:
+        return []
 
-# 设置一个距离阈值，来判断哪些点是重叠的
-threshold = 0.02  # 设置重叠点的距离阈值
-overlap_mask = dist_matrix < threshold
+    # Convert points to numpy array
+    points = np.asarray(cloud.points)
+    
+    # Build the KDTree for fast neighbor search
+    kdtree = KDTree(points)
+    
+    # Calculate neighbors for each point in parallel
+    nbs = []
+    with ThreadPoolExecutor() as executor:
+        nbs = list(executor.map(lambda pt: kdtree.query_ball_point(pt, eps), points))
+    
+    # Initialize labels with -2 (unvisited)
+    labels = np.full(len(points), -2)
+    cluster_label = 0
+    
+    # DBSCAN clustering
+    for idx in range(len(points)):
+        # Skip already visited points
+        if labels[idx] != -2:
+            continue
 
-# 设置对角线为False，因为每个点与自己距离为0
-cp.fill_diagonal(overlap_mask, False)
+        # Set min_points based on distance from zero_pos
+        min_points = min_points_k / np.linalg.norm(points[idx] - zero_pos)**2
+        
+        # If the point has fewer neighbors than the threshold, label as noise
+        if len(nbs[idx]) < min_points:
+            labels[idx] = -1
+            continue
 
-# 通过mask去除重叠点
-# 重叠点将被标记为True，我们根据这个mask来去除重复点
-unique_points_mask = cp.any(overlap_mask, axis=1)
+        # Use BucketSet for efficient management of neighbors and visited points
+        nbs_next = BucketSet(len(points))
+        nbs_visited = BucketSet(len(points))
+        
+        for nb in nbs[idx]:
+            nbs_next.insert(nb)
+        nbs_visited.insert(idx)
+        
+        labels[idx] = cluster_label
+        
+        # BFS to expand cluster
+        while nbs_next.size > 0:
+            nb = nbs_next.now_first
+            nbs_next.erase(nb)
+            nbs_visited.insert(nb)
 
-# 得到不重复的点云
-unique_points = points_gpu[~unique_points_mask]
+            # If the neighbor is not visited, label it with the current cluster
+            if labels[nb] == -2:
+                labels[nb] = cluster_label
 
-# 将结果从GPU转回到CPU
-unique_points_cpu = cp.asnumpy(unique_points)
+            # If the neighbor has enough points, add its neighbors to the list
+            if len(nbs[nb]) >= min_points:
+                for qnb in nbs[nb]:
+                    if not nbs_visited.bucket[qnb]:
+                        nbs_next.insert(qnb)
 
-# 打印去重后的点云
-print(f"去重后的点云数量: {unique_points_cpu.shape[0]}")
+        cluster_label += 1
+
+    return labels
+
+
+def normal_dbscan(cloud, eps, min_points):
+    # Check if the point cloud is empty
+    if len(cloud.points) == 0:
+        return []
+
+    # Convert points to numpy array
+    points = np.asarray(cloud.points)
+
+    # Build the KDTree for fast neighbor search
+    kdtree = KDTree(points)
+
+    # Calculate neighbors for each point in parallel
+    nbs = []
+    with ThreadPoolExecutor() as executor:
+        nbs = list(executor.map(lambda pt: kdtree.query_ball_point(pt, eps), points))
+
+    # Initialize labels with -2 (unvisited)
+    labels = np.full(len(points), -2)
+    cluster_label = 0
+
+    # DBSCAN clustering
+    for idx in range(len(points)):
+        # Skip already visited points
+        if labels[idx] != -2:
+            continue
+
+        # If the point has fewer neighbors than the threshold, label as noise
+        if len(nbs[idx]) < min_points:
+            labels[idx] = -1
+            continue
+
+        # Use BucketSet for efficient management of neighbors and visited points
+        nbs_next = BucketSet(len(points))
+        nbs_visited = BucketSet(len(points))
+        
+        for nb in nbs[idx]:
+            nbs_next.insert(nb)
+        nbs_visited.insert(idx)
+        
+        labels[idx] = cluster_label
+        
+        # BFS to expand cluster
+        while nbs_next.size > 0:
+            nb = nbs_next.now_first
+            nbs_next.erase(nb)
+            nbs_visited.insert(nb)
+
+            # If the neighbor is not visited, label it with the current cluster
+            if labels[nb] == -2:
+                labels[nb] = cluster_label
+
+            # If the neighbor has enough points, add its neighbors to the list
+            if len(nbs[nb]) >= min_points:
+                for qnb in nbs[nb]:
+                    if not nbs_visited.bucket[qnb]:
+                        nbs_next.insert(qnb)
+
+        cluster_label += 1
+
+    return labels
+
+
+# Example usage
+if __name__ == "__main__":
+    # Create a point cloud (for demonstration purposes)
+    pcd = o3d.io.read_point_cloud("path_to_your_point_cloud.ply")
+
+    zero_pos = np.array([0.0, 0.0, 0.0])  # Reference position
+    eps = 0.1  # Neighborhood radius
+    min_points_k = 10  # Minimum points in a neighborhood (for differing DBSCAN)
+    min_points = 5  # Minimum points in a neighborhood (for normal DBSCAN)
+
+    # Call the DBSCAN functions
+    labels_differing = differing_dbscan(pcd, zero_pos, eps, min_points_k)
+    labels_normal = normal_dbscan(pcd, eps, min_points)
+
+    print("Differing DBSCAN labels:", labels_differing)
+    print("Normal DBSCAN labels:", labels_normal)
