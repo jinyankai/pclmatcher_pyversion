@@ -1,55 +1,63 @@
-import os
 import rosbag
-import csv
-import rospy
+import numpy as np
+import pandas as pd
+import os
 
-def convert_bag_to_csv(bag_file, output_folder):
-    """
-    将 rosbag 文件中的所有话题提取并转换为 CSV 文件
-    :param bag_file: 输入的 rosbag 文件路径
-    :param output_folder: 输出的 CSV 文件存储文件夹
-    """
-    # 提取文件名并构造输出文件的路径
-    bag_filename = os.path.basename(bag_file)
-    csv_filename = os.path.splitext(bag_filename)[0] + '.csv'
-    csv_filepath = os.path.join(output_folder, csv_filename)
+# 计算MSE
+def calculate_mse(predictions, targets):
+    return np.mean((predictions - targets) ** 2)
 
-    # 打开 rosbag 文件
+# 读取并处理一个rosbag文件
+def process_rosbag_file(bag_file):
+    mse_results = []  # 保存每个话题的MSE结果
+
+    # 打开rosbag文件
     bag = rosbag.Bag(bag_file)
-    
-    # 打开 CSV 文件进行写入
-    with open(csv_filepath, mode='w', newline='') as csv_file:
-        writer = csv.writer(csv_file)
-        writer.writerow(['Topic', 'Timestamp', 'Message'])  # CSV 文件的头部
 
-        # 遍历 rosbag 中的每个消息
-        for topic, msg, t in bag.read_messages():
-            # 写入话题名，时间戳和消息内容
-            writer.writerow([topic, t.to_sec(), str(msg)])
+    # 用于存储x值
+    ground_truth_x = []
+    target_x = []
 
-    bag.close()
-    rospy.loginfo(f"文件 {csv_filepath} 已保存！")
+    try:
+        # 遍历rosbag中的消息
+        for topic, msg, t in bag.read_messages(topics=['/ground_truth/state_triangle_link_base', '/target']):
+            # 提取消息中的x值
+            if topic == '/ground_truth/state_triangle_link_base':
+                x_value = msg.pose.pose.position.x
+                ground_truth_x.append(x_value)
+            elif topic == '/target':
+                x_value = msg.pose.pose.position.x
+                target_x.append(x_value)
 
-def convert_all_bags_in_folder(input_folder, output_folder):
-    """
-    读取指定文件夹中的所有 bag 文件并转换为 csv 文件
-    :param input_folder: 存放 .bag 文件的文件夹
-    :param output_folder: 存放 .csv 文件的文件夹
-    """
-    # 确保输出文件夹存在
-    if not os.path.exists(output_folder):
-        os.makedirs(output_folder)
+        # 计算MSE
+        if ground_truth_x and target_x:
+            mse = calculate_mse(np.array(ground_truth_x), np.array(target_x))
+            mse_results.append({'bag_file': bag_file, 'mse': mse})
 
-    # 遍历输入文件夹中的所有 .bag 文件
-    for filename in os.listdir(input_folder):
-        if filename.endswith(".bag"):
-            bag_file = os.path.join(input_folder, filename)
-            convert_bag_to_csv(bag_file, output_folder)
+    except Exception as e:
+        print(f"Error processing bag file {bag_file}: {e}")
+    finally:
+        bag.close()
 
-if __name__ == "__main__":
-    # 输入和输出文件夹路径
-    input_folder = "/path/to/your/bag/files"  # 替换成包含 .bag 文件的文件夹路径
-    output_folder = "/path/to/save/csv"  # 替换成保存 .csv 文件的文件夹路径
+    return mse_results
 
-    convert_all_bags_in_folder(input_folder, output_folder)
-    print("所有文件转换完成！")
+# 处理文件夹中的所有rosbag文件
+def process_rosbag_folder(folder_path):
+    all_mse_results = []  # 用来保存所有文件的MSE结果
+
+    # 遍历文件夹中的所有文件
+    for filename in os.listdir(folder_path):
+        if filename.endswith('.bag'):  # 只处理rosbag文件
+            bag_file_path = os.path.join(folder_path, filename)
+            print(f"Processing {bag_file_path}...")
+            mse_results = process_rosbag_file(bag_file_path)
+            all_mse_results.extend(mse_results)  # 将当前文件的结果添加到总结果中
+
+    # 将所有结果保存到一个新的CSV文件
+    mse_df = pd.DataFrame(all_mse_results)
+    mse_df.to_csv('mse_result.csv', index=False)
+    print("MSE results have been saved to mse_result.csv.")
+
+# 设置文件夹路径并调用函数
+folder_path = '/path/to/your/folder'  # 请替换为实际文件夹路径
+process_rosbag_folder(folder_path)
