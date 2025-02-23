@@ -9,7 +9,8 @@ def calculate_mse(predictions, targets):
 
 # 读取并处理一个rosbag文件
 def process_rosbag_file(bag_file):
-    mse_results = []  # 保存每个话题的MSE结果
+    total_mse = 0.0  # 总MSE
+    total_count = 0  # 数据对数
 
     # 打开rosbag文件
     bag = rosbag.Bag(bag_file)
@@ -29,17 +30,18 @@ def process_rosbag_file(bag_file):
                 x_value = msg.pose.pose.position.x
                 target_x.append(x_value)
 
-        # 计算MSE
-        if ground_truth_x and target_x:
-            mse = calculate_mse(np.array(ground_truth_x), np.array(target_x))
-            mse_results.append({'bag_file': bag_file, 'mse': mse})
+            # 当两个话题的数据都存在时，计算局部MSE
+            if len(ground_truth_x) == len(target_x):
+                mse = calculate_mse(np.array(ground_truth_x), np.array(target_x))
+                total_mse += mse
+                total_count += 1
 
     except Exception as e:
         print(f"Error processing bag file {bag_file}: {e}")
     finally:
         bag.close()
 
-    return mse_results
+    return total_mse, total_count
 
 # 处理文件夹中的所有rosbag文件
 def process_rosbag_folder(folder_path):
@@ -50,8 +52,12 @@ def process_rosbag_folder(folder_path):
         if filename.endswith('.bag'):  # 只处理rosbag文件
             bag_file_path = os.path.join(folder_path, filename)
             print(f"Processing {bag_file_path}...")
-            mse_results = process_rosbag_file(bag_file_path)
-            all_mse_results.extend(mse_results)  # 将当前文件的结果添加到总结果中
+            total_mse, total_count = process_rosbag_file(bag_file_path)
+            
+            # 计算平均MSE并保存结果
+            if total_count > 0:
+                avg_mse = total_mse / total_count
+                all_mse_results.append({'bag_file': bag_file_path, 'avg_mse': avg_mse})
 
     # 将所有结果保存到一个新的CSV文件
     mse_df = pd.DataFrame(all_mse_results)
