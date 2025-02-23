@@ -42,6 +42,6 @@ def plot_error_data(file1, file2):
     plt.show()
 
 # 调用函数，传入两个rosbag文件路径
-file1 = '/path/to/your/first_file.bag'  # 替换为第一个rosbag文件路径
-file2 = '/path/to/your/second_file.bag'  # 替换为第二个rosbag文件路径
+file1 = '/home/nvidia/rosbag/bag/2025-02-22-20-33-46.bag'  # 替换为第一个rosbag文件路径
+file2 = '/home/nvidia/rosbag/target/2025-02-23-15-57-32.bag'  # 替换为第二个rosbag文件路径
 plot_error_data(file1, file2)
