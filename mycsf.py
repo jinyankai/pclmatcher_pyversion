@@ -1,174 +1,55 @@
-import numpy as np
-import open3d as o3d
-from scipy.spatial import KDTree
-from collections import deque
-from concurrent.futures import ThreadPoolExecutor
+import os
+import rosbag
+import csv
+import rospy
 
-class BucketSet:
-    def __init__(self, size):
-        self.bucket = np.zeros(size, dtype=bool)
-        self.size = 0
-        self.now_first = -1
+def convert_bag_to_csv(bag_file, output_folder):
+    """
+    将 rosbag 文件中的所有话题提取并转换为 CSV 文件
+    :param bag_file: 输入的 rosbag 文件路径
+    :param output_folder: 输出的 CSV 文件存储文件夹
+    """
+    # 提取文件名并构造输出文件的路径
+    bag_filename = os.path.basename(bag_file)
+    csv_filename = os.path.splitext(bag_filename)[0] + '.csv'
+    csv_filepath = os.path.join(output_folder, csv_filename)
 
-    def insert(self, value):
-        if not self.bucket[value]:
-            self.bucket[value] = True
-            self.size += 1
-            if value < self.now_first or self.now_first == -1:
-                self.now_first = value
-
-    def erase(self, value):
-        if self.bucket[value]:
-            self.bucket[value] = False
-            self.size -= 1
-            if self.size == 0:
-                self.now_first = -1
-            elif value == self.now_first:
-                for i in range(value + 1, len(self.bucket)):
-                    if self.bucket[i]:
-                        self.now_first = i
-                        break
-
-def differing_dbscan(cloud, zero_pos, eps, min_points_k):
-    # Check if the point cloud is empty
-    if len(cloud.points) == 0:
-        return []
-
-    # Convert points to numpy array
-    points = np.asarray(cloud.points)
+    # 打开 rosbag 文件
+    bag = rosbag.Bag(bag_file)
     
-    # Build the KDTree for fast neighbor search
-    kdtree = KDTree(points)
-    
-    # Calculate neighbors for each point in parallel
-    nbs = []
-    with ThreadPoolExecutor() as executor:
-        nbs = list(executor.map(lambda pt: kdtree.query_ball_point(pt, eps), points))
-    
-    # Initialize labels with -2 (unvisited)
-    labels = np.full(len(points), -2)
-    cluster_label = 0
-    
-    # DBSCAN clustering
-    for idx in range(len(points)):
-        # Skip already visited points
-        if labels[idx] != -2:
-            continue
+    # 打开 CSV 文件进行写入
+    with open(csv_filepath, mode='w', newline='') as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerow(['Topic', 'Timestamp', 'Message'])  # CSV 文件的头部
 
-        # Set min_points based on distance from zero_pos
-        min_points = min_points_k / np.linalg.norm(points[idx] - zero_pos)**2
-        
-        # If the point has fewer neighbors than the threshold, label as noise
-        if len(nbs[idx]) < min_points:
-            labels[idx] = -1
-            continue
+        # 遍历 rosbag 中的每个消息
+        for topic, msg, t in bag.read_messages():
+            # 写入话题名，时间戳和消息内容
+            writer.writerow([topic, t.to_sec(), str(msg)])
 
-        # Use BucketSet for efficient management of neighbors and visited points
-        nbs_next = BucketSet(len(points))
-        nbs_visited = BucketSet(len(points))
-        
-        for nb in nbs[idx]:
-            nbs_next.insert(nb)
-        nbs_visited.insert(idx)
-        
-        labels[idx] = cluster_label
-        
-        # BFS to expand cluster
-        while nbs_next.size > 0:
-            nb = nbs_next.now_first
-            nbs_next.erase(nb)
-            nbs_visited.insert(nb)
+    bag.close()
+    rospy.loginfo(f"文件 {csv_filepath} 已保存！")
 
-            # If the neighbor is not visited, label it with the current cluster
-            if labels[nb] == -2:
-                labels[nb] = cluster_label
+def convert_all_bags_in_folder(input_folder, output_folder):
+    """
+    读取指定文件夹中的所有 bag 文件并转换为 csv 文件
+    :param input_folder: 存放 .bag 文件的文件夹
+    :param output_folder: 存放 .csv 文件的文件夹
+    """
+    # 确保输出文件夹存在
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
 
-            # If the neighbor has enough points, add its neighbors to the list
-            if len(nbs[nb]) >= min_points:
-                for qnb in nbs[nb]:
-                    if not nbs_visited.bucket[qnb]:
-                        nbs_next.insert(qnb)
+    # 遍历输入文件夹中的所有 .bag 文件
+    for filename in os.listdir(input_folder):
+        if filename.endswith(".bag"):
+            bag_file = os.path.join(input_folder, filename)
+            convert_bag_to_csv(bag_file, output_folder)
 
-        cluster_label += 1
-
-    return labels
-
-
-def normal_dbscan(cloud, eps, min_points):
-    # Check if the point cloud is empty
-    if len(cloud.points) == 0:
-        return []
-
-    # Convert points to numpy array
-    points = np.asarray(cloud.points)
-
-    # Build the KDTree for fast neighbor search
-    kdtree = KDTree(points)
-
-    # Calculate neighbors for each point in parallel
-    nbs = []
-    with ThreadPoolExecutor() as executor:
-        nbs = list(executor.map(lambda pt: kdtree.query_ball_point(pt, eps), points))
-
-    # Initialize labels with -2 (unvisited)
-    labels = np.full(len(points), -2)
-    cluster_label = 0
-
-    # DBSCAN clustering
-    for idx in range(len(points)):
-        # Skip already visited points
-        if labels[idx] != -2:
-            continue
-
-        # If the point has fewer neighbors than the threshold, label as noise
-        if len(nbs[idx]) < min_points:
-            labels[idx] = -1
-            continue
-
-        # Use BucketSet for efficient management of neighbors and visited points
-        nbs_next = BucketSet(len(points))
-        nbs_visited = BucketSet(len(points))
-        
-        for nb in nbs[idx]:
-            nbs_next.insert(nb)
-        nbs_visited.insert(idx)
-        
-        labels[idx] = cluster_label
-        
-        # BFS to expand cluster
-        while nbs_next.size > 0:
-            nb = nbs_next.now_first
-            nbs_next.erase(nb)
-            nbs_visited.insert(nb)
-
-            # If the neighbor is not visited, label it with the current cluster
-            if labels[nb] == -2:
-                labels[nb] = cluster_label
-
-            # If the neighbor has enough points, add its neighbors to the list
-            if len(nbs[nb]) >= min_points:
-                for qnb in nbs[nb]:
-                    if not nbs_visited.bucket[qnb]:
-                        nbs_next.insert(qnb)
-
-        cluster_label += 1
-
-    return labels
-
-
-# Example usage
 if __name__ == "__main__":
-    # Create a point cloud (for demonstration purposes)
-    pcd = o3d.io.read_point_cloud("path_to_your_point_cloud.ply")
+    # 输入和输出文件夹路径
+    input_folder = "/path/to/your/bag/files"  # 替换成包含 .bag 文件的文件夹路径
+    output_folder = "/path/to/save/csv"  # 替换成保存 .csv 文件的文件夹路径
 
-    zero_pos = np.array([0.0, 0.0, 0.0])  # Reference position
-    eps = 0.1  # Neighborhood radius
-    min_points_k = 10  # Minimum points in a neighborhood (for differing DBSCAN)
-    min_points = 5  # Minimum points in a neighborhood (for normal DBSCAN)
-
-    # Call the DBSCAN functions
-    labels_differing = differing_dbscan(pcd, zero_pos, eps, min_points_k)
-    labels_normal = normal_dbscan(pcd, eps, min_points)
-
-    print("Differing DBSCAN labels:", labels_differing)
-    print("Normal DBSCAN labels:", labels_normal)
+    convert_all_bags_in_folder(input_folder, output_folder)
+    print("所有文件转换完成！")
