@@ -1,72 +1,191 @@
-import torch
+# 构建Lidar类，作为激光雷达接收类，构建一个ros节点持续订阅/livox/lidar话题，把点云信息写入PcdQueue,整个以子线程形式运行
+import sys
+
+from scipy.stats._multivariate import invwishart_frozen
+
+sys.path.append("/home/nvidia/RadarWorkspace/code/Hust-Radar-2024/Lidar")
+from PointCloud import *
+import threading
+import rospy
+import tf_conversions
+ # 引入 std_msgs/Float32MultiArray
+from geometry_msgs.msg import TransformStamped
 import numpy as np
 import time
+from sensor_msgs.msg import PointCloud2
+import sensor_msgs.point_cloud2 as pc2
+from scipy.spatial.transform import Rotation as R
 
-class FastSearch:
-    def __init__(self, device="cuda", Radius_upperbound=1):
-        self.dynamic_pcd = None  # 动态障碍物点云，是寻找的目标
-        self.device = device
-        self.src_pcd = None
-        self.r = Radius_upperbound  # 设定最大半径上限
 
-    # 计算所有点到目标点的欧氏距离（只计算xy维度的距离）
-    def compute_distances(self, point_cloud_tensor, point_0_tensor):
+
+class Process_Lidar:
+    def __init__(self,cfg):
+        # 标志位
+        self.flag = False  # 激光雷达接收启动标志
+        self.init_flag = False # 激光雷达接收线程初始化标志
+        self.working_flag = False  # 激光雷达接收线程启动标志
+        self.threading_1 = None  # 激光雷达接收子线程
+        self.stop_event = threading.Event()  # 线程停止事件
+        self.got_tf = False  # 是否接收到了tf
+
+
+        # 参数
+        self.height_threshold = cfg["lidar"]["height_threshold"]  # 自身高度，用于去除地面点云
+        self.min_distance = cfg["lidar"]["min_distance"]  # 最近距离，距离小于这个范围的不要
+        self.max_distance = cfg["lidar"]["max_distance"]  # 最远距离，距离大于这个范围的不要
+        # self.lidar_topic_name = cfg["lidar"]["lidar_topic_name"] # 激光雷达话题名
+        self.obstacle_topic_name = "/obstacle_cloud" # 障碍物发布话题名字 # 动态障碍物话题名
+
+        # 点云队列
+        self.pcdQueue = PcdQueue(max_size=10) # 将激光雷达接收的点云存入点云队列中，读写上锁？
+        self.obstacleQueue = centroidsQueue(max_size=20) # 将动态障碍物的云加入队列中
+
+        # 激光雷达线程
+        self.lock = threading.Lock()  # 线程锁
+        # transformation_matrix
+        self.transformation_matrix = None
+
+        # 中心点序列
+        self.centroids = None
+
+
+
+
+        if not self.init_flag:
+            # 当雷达还未有一个对象时，初始化接收节点
+            self.listener_begin()
+            # print("listener_begin")
+            self.init_flag = True
+            self.threading_1 = threading.Thread(target=self.main_loop, daemon=True)
+
+
+    # 线程启动
+    def start(self):
+        '''
+        开始子线程，即开始spin
+        '''
+        if not self.working_flag:
+            self.working_flag = True
+            self.threading_1.start()
+
+            # print("start@")
+
+    # 线程关闭
+    def stop(self):
+        '''
+        结束子线程
+        '''
+        if self.working_flag and self.threading_1 is not None: # 关闭时写错了之前，写成了if not self.working_flag
+            self.stop_event.set()
+            rospy.signal_shutdown('Stop requested')
+            self.working_flag = False
+            print("stop")
+
+    # 安全关闭子线程
+    # def _async_raise(self,tid, exctype):
+    #     """raises the exception, performs cleanup if needed"""
+    #     tid = ctypes.c_long(tid)
+    #     if not inspect.isclass(exctype):
+    #         exctype = type(exctype)
+    #     res = ctypes.pythonapi.PyThreadState_SetAsyncExc(tid, ctypes.py_object(exctype))
+    #     if res == 0:
+    #         raise ValueError("invalid thread id")
+    #     elif res != 1:
+    #         # """if it returns a number greater than one, you're in trouble,
+    #         # and you should call it again with exc=NULL to revert the effect"""
+    #         ctypes.pythonapi.PyThreadState_SetAsyncExc(tid, None)
+    #         raise SystemError("PyThreadState_SetAsyncExc failed")
+    #
+    # # 停止线程，中间方法
+    # def stop_thread(self,thread):
+    #     self._async_raise(thread.ident, SystemExit)
+
+
+    # 节点启动
+    def listener_begin(self):
+        rospy.init_node('laser_listener', anonymous=True)
+        print('strategy')
+        rospy.Subscriber("/centroid_points", PointCloud2, self.callback)
+
+    # 订阅节点子线程
+    def main_loop(self):
+        # 通过将spin放入子线程来防止其对主线程的阻塞
+        rospy.spin()
+        # xyz = self.obstacleQueue.get_all_pc()
+        # self.visualizd(xyz)
+
+    def quaternion2rot(self,quaternion):
+        r = R.from_quat(quaternion)
+        rot = r.as_matrix()
+        return rot
+
+
+
+    def combine_transform(self,R, t):
         """
-        计算点云中所有点到点云0的欧氏距离，只计算xy维度
-        :param point_cloud_tensor: 点云数据，PyTorch Tensor，形状为 (N, 3)
-        :param point_0_tensor: 目标点，PyTorch Tensor，形状为 (3,)
-        :return: 每个点到目标点的欧氏距离（xy维度），PyTorch Tensor，形状为 (N,)
+        Combine a rotation matrix R and a translation vector t into a transformation matrix.
+
+        Parameters:
+        R (numpy.ndarray): A 3x3 rotation matrix.
+        t (numpy.ndarray): A 3x1 translation vector.
+
+        Returns:
+        numpy.ndarray: A 4x4 transformation matrix.
         """
-        # 只选择 x 和 y 维度
-        point_cloud_xy = point_cloud_tensor[:, :2]
-        point_0_xy = point_0_tensor[:2]
+        # 确保R是3x3矩阵，t是3x1矩阵
+        assert R.shape == (3, 3), "Rotation matrix R must be 3x3."
+        assert t.shape == (3, 1), "Translation vector t must be 3x1."
+        # 创建4x4变换矩阵
+        T = np.eye(4)  # 4x4单位矩阵
+        # 将旋转矩阵R放入变换矩阵的左上角3x3部分
+        T[:3, :3] = R
+        # 将平移向量t放入变换矩阵的右列
+        T[:3, 3] = t.flatten()
+        return T
 
-        # 计算 xy 维度的欧氏距离
-        return torch.norm(point_cloud_xy - point_0_xy, dim=1)
-
-    # 查找距离目标点最近的点，并判断最小距离是否超过设定的阈值
-    def find_nearest_point(self, point_cloud, point_0):
+    def callback(self, msg):
         """
-        找到点云中距离点云0最近的点（只考虑xy维度）
-        :param point_cloud: 点云数据，NumPy 数组，形状为 (N, 3)
-        :param point_0: 查询点，NumPy 数组，形状为 (3,)
-        :return: 最近点，NumPy 数组，形状为 (3,)
-        :return: 最近点的距离，float
-        :return: 是否超过阈值，bool
+        回调函数，处理接收到的 PointCloud 消息
         """
-        # 转换为 PyTorch 张量，并移动到指定设备
-        point_cloud_tensor = torch.tensor(point_cloud, dtype=torch.float32).to(self.device)
-        point_0_tensor = torch.tensor(point_0, dtype=torch.float32).to(self.device)
-
-        # 计算每个点到点云0的距离（只考虑xy维度）
-        distances = self.compute_distances(point_cloud_tensor, point_0_tensor)
-
-        # 找到最小距离的索引
-        min_distance_idx = torch.argmin(distances)
-
-        # 获取距离最近的点
-        nearest_point = point_cloud_tensor[min_distance_idx]
-
-        # 获取最小距离
-        min_distance = distances[min_distance_idx]
-
-        # 判断最小距离是否超过阈值
-        distance_exceeds_threshold = min_distance.item() > self.r
-
-        # 转换为 NumPy 数组并返回
-        nearest_point_xyz = nearest_point.cpu().numpy()  # 移动回 CPU 并转为 NumPy 数组
-        return nearest_point_xyz, min_distance.item(), distance_exceeds_threshold
+        # 解析 msg 中的点云数据
+        print('start')
+        points = pc2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True)
+        points = list(points)
+        centroids = np.array(points, dtype=np.float32)
 
 
-    # 示例使用
+        # 使用锁保护共享数据
+        with self.lock:
+            self.centroids = centroids
+            # 根据需求处理数据
+            self.obstacleQueue.add(self.centroids)  # 假设是一个队列
+
+        print("Received centroids as numpy array:\n", centroids)
+
+    # 获取所有点云
+    def get_all_pc(self):
+        with self.lock:
+            return self.obstacleQueue.get_all_pc()
+
+
+    # del
+    def __del__(self):
+        self.stop()
+
 if __name__ == "__main__":
-    # 假设 point_cloud 和 point_0 是你已经有的 NumPy 数组
-    point_cloud = np.random.rand(15000, 3)  # 示例点云数据
-    point_0 = np.array([1.0, 2.0, 3.0])  # 示例查询点
-    f = FastSearch(device = "cuda",Radius_upperbound = 5)
-    t1 = time.time()
-    # 查找距离最近的点
-    nearest_point, min_distance, ans = f.find_nearest_point(point_cloud, point_0)
-    t2 = time.time()
-    print("用时：",(t2-t1)*1000,"ms")
-    print(f"最接近的点是: {nearest_point}, 距离是: {min_distance}")
+    cfg = {
+        "lidar": {
+            "height_threshold": 0.05,
+            "min_distance": 0.1,
+            "max_distance": 20,
+            "lidar_topic_name": "/adjusted_cloud"
+        }
+    }
+    lidar = Process_Lidar(cfg)
+    lidar.start()
+    xyz = lidar.get_all_pc()
+
+    time.sleep(1000)
+
+    lidar.stop()
+    print("end")
