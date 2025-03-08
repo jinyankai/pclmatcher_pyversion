@@ -3,23 +3,20 @@ from communication.Messager import Messager
 from detect.Detector import Detector
 from detect.Video import Video
 from detect.Capture import Capture
-from Lidar.Lidar import Process_Lidar
+# from Lidar.Lidar import Lidar
 from Lidar.Converter import Converter , ROISelector
 from Log.Log import RadarLog
 from Car.Car import *
 import numpy as np
 import cv2
 import time
-from Car.Topo_map import Topo_map # 不加可视化对象
+import open3d as o3d
 from collections import deque
 from ruamel.yaml import YAML
 import os
 
 mode = "video" # "video" or "camera" , 如果纯视频模式选用video,需要播放录制livox mid-70的rosbag获得点云信息
-save_video = True # 是否保存视频
-
-
-
+save_video = False # 是否保存视频
 
 if __name__ == '__main__':
     video_path = "./data/video.avi" # 请改为/path/to/video.avi
@@ -30,21 +27,6 @@ if __name__ == '__main__':
     main_cfg = YAML().load(open(main_config_path, encoding='Utf-8', mode='r'))
     # 全局变量
     global_my_color = main_cfg['global']['my_color']
-    if global_my_color == 'Blue':
-        enemy_color = 'Red'
-    else:
-        enemy_color = 'Blue'
-
-    def post_process(xy, color=global_my_color):
-        if color == 'Blue':
-            # 转换坐标
-            x, y, z = xy
-            [x, y, z] = [28 - x, 15 - y, z]
-        else:
-            [x, y, z] = xy
-        return [x, y, z]
-
-
     is_debug = main_cfg['global']['is_debug']
 
     # 设置保存路径
@@ -65,11 +47,10 @@ if __name__ == '__main__':
     draw_queue = deque(maxlen=10)
     # 类初始化
     detector = Detector(detector_config_path)
-    lidar = Process_Lidar(main_cfg)
+    # lidar = Lidar(main_cfg)
     converter = Converter(global_my_color,converter_config_path)  # 传入的是path
     carList = CarList(main_cfg)
     logger.log("carList init")
-    topo_map = Topo_map.Topology(global_my_color)
 
     messager = Messager(main_cfg , draw_queue)
     logger.log("messager init")
@@ -102,7 +83,7 @@ if __name__ == '__main__':
 
     detector.create(capture)
     detector.start()
-    lidar.start()
+    # lidar.start()
     messager.start()
 
     # 创建一个空列表来存储所有检测的结果
@@ -136,10 +117,9 @@ if __name__ == '__main__':
 
             # 需要打包一份给carList
             carList_results = []
-            match_info = []
             result_img = None
 
-            if_lidar = False
+
             # 确保推理结果不为空且可以解包
             if infer_result is not None:
                 # print(infer_result)
@@ -147,27 +127,21 @@ if __name__ == '__main__':
 
                 if results is not None:
                     print("results is not none")
-                    if lidar.pcdQueue.point_num == 0:
-                        print("no pcd")
-
-
-                    pc_all = lidar.get_all_pc()
-
-                    # 判断pc_all是否为空
-                    if len(pc_all) == 0:
-                        print("pc_all is empty")
-                        if_lidar = False
-                    else:
-                        if_lidar = True
-
-                    # 创建总体点云pcd
+                    # if lidar.pcdQueue.point_num == 0:
+                    #     print("no pcd")
+                    #     continue
+                    # 
+                    # pc_all = lidar.get_all_pc()
+                    # 
+                    # 
+                    # # 创建总体点云pcd
                     # pcd_all = o3d.geometry.PointCloud()
                     # pcd_all.points = o3d.utility.Vector3dVector(pc_all)
-                    #
-                    #
+                    # 
+                    # 
                     # # 将总体点云转到相机坐标系下
                     # converter.lidar_to_camera(pcd_all)
-                    #
+                    # 
                     # # 检测框对应点云
                     # box_pcd = o3d.geometry.PointCloud()
 
@@ -192,41 +166,37 @@ if __name__ == '__main__':
                         new_w = xywh_box[2] / div_times
                         new_h = xywh_box[3] / div_times
                         new_xyxy_box = [xywh_box[0] - new_w / 2, xywh_box[1] - new_h / 2, xywh_box[0] + new_w / 2, xywh_box[1] + new_h / 2]
-                        # 25_new detection
-                        # TODO
-                        location = converter.detection_main(box=new_xyxy_box,pcd=pc_all,if_lidar=if_lidar)
-
-
-
-                        # 获取检测框内numpy格式pc
+                        center = converter.detection_main(new_xyxy_box, pcd_all)
+                        distance = converter.get_distance(center)
+                        # # 获取检测框内numpy格式pc
                         # box_pc = converter.get_points_in_box(pcd_all.points, new_xyxy_box)
                         # print(len(box_pc))
                         # # 如果没有获取到点，直接continue
                         # if len(box_pc) == 0:
                         #     print("no points in box")
                         #     continue
-                        #
+                        # 
                         # box_pcd.points = o3d.utility.Vector3dVector(box_pc)
-
-                        # 点云过滤
+                        # 
+                        # # 点云过滤
                         # box_pcd = converter.filter(box_pcd)
-                        #
+                        # 
                         # # 获取box_pcd的中心点
                         # cluster_result = converter.cluster(box_pcd) # 也就6帧变7帧，还是启用
-                        #
+                        # 
                         # _, center = cluster_result
                         # # # 如果聚类结果为空，则用中值取点
-                        if len(location):
-                            center = converter.get_center_mid_distance(location)# TODO
-
-
-                        # 计算距离
-                        distance = converter.get_distance(location)
+                        # if center[0] == 0 and center[1] == 0 and center[2] == 0:
+                        #     center = converter.get_center_mid_distance(box_pcd)
+                        # 
+                        # 
+                        # # 计算距离
+                        # distance = converter.get_distance(center)
                         if distance == 0:
                             continue
 
                         # 将点转到赛场坐标系下
-                        field_xyz = location
+                        field_xyz = center
                         # 计算赛场坐标系下的距离
                         field_distance = converter.get_distance(field_xyz)
 
@@ -237,14 +207,13 @@ if __name__ == '__main__':
                                         cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 122), 2)
 
                         # 将结果打包
-                        carList_results.append([track_id , carList.get_car_id(label) , xywh_box , 1 , location , field_xyz, now])# 提取location前两个元素
-
+                        carList_results.append([track_id , carList.get_car_id(label) , xywh_box , 1 , center , field_xyz])
 
                     # 将结果传入carList
             carList.update_car_info(carList_results)
-            best_regions = topo_map.run(carList_results,is_debug)
 
-            all_infos = carList.get_all_info() # 此步不做trust的筛选，留给messager做  n
+
+            all_infos = carList.get_all_info() # 此步不做trust的筛选，留给messager做
             my_car_infos = []
             enemy_car_infos = []
             # result in results:[car_id , center_xy , camera_xyz , field_xyz]
@@ -266,7 +235,6 @@ if __name__ == '__main__':
 
             # 通信
             messager.update_enemy_car_infos(enemy_car_infos)
-            # messager.update_region(best_regions)
 
 
             # 画线
@@ -287,13 +255,13 @@ if __name__ == '__main__':
                         # 如果不可信，跳过
                         if not enemy_is_valid or enemy_track_id == -1: # 不可信或未初始化
                             continue
-                            # 计算距离
-                        distance = np.linalg.norm(np.array(my_field_xyz) - np.array(enemy_field_xyz))
                         # 将相机的xyz坐标点投影到图像上，并画一个红色的点
                         if is_debug:
                             enemy_camera_xyz = enemy_camera_xyz.reshape(1, -1)
                             enemy_reprojected_point = converter.camera_to_image(enemy_camera_xyz)[0]  # u,v是图像坐标系下的坐标
-
+                        # 计算距离
+                        distance = np.linalg.norm(np.array(my_field_xyz) - np.array(enemy_field_xyz))
+                        if is_debug:
                             cv2.circle(result_img, (int(enemy_reprojected_point[0]), int(enemy_reprojected_point[1])), 5,
                                        (0, 0, 255), -1)
                             # 画线,从我方车辆中心点到敌方车辆中心点
